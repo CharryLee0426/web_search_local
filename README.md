@@ -32,6 +32,7 @@ Client (curl / Open WebUI / OpenAI SDK / CLI)
 
 | Tool | Description |
 |------|-------------|
+| `news_search` | Latest finance/politics headlines via Google News RSS + news backends, ranked toward reputable outlets |
 | `web_search` | Metasearch via self-hosted [SearXNG](https://docs.searxng.org/) or [DDGS](https://pypi.org/project/ddgs/) fallback |
 | `read_webpage` | Download a URL and extract readable article text |
 | `get_weather` | Daily forecast via [Open-Meteo](https://open-meteo.com/) (no API key) |
@@ -258,8 +259,9 @@ GATEWAY_PORT=8001 GATEWAY_VERBOSE=1 OLLAMA_MODEL=qwen3.6:latest python server.py
 6. The model either calls another tool or returns the final answer.
 
 ```text
+News / finance / politics → news_search → read_webpage → cited briefing
+Other research     → web_search → read_webpage → cited answer
 Weather question  → get_weather → Open-Meteo JSON → summary
-News / sports     → web_search → read_webpage → cited answer
 ```
 
 ---

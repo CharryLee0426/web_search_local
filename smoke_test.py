@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import sys
 
-from tools import get_weather, read_webpage, web_search
+from tools import get_weather, news_search, read_webpage, web_search
 
 
 def _print(label: str, payload: dict) -> None:
@@ -19,6 +19,51 @@ def main() -> int:
     _print("web_search", search)
     if search.get("error"):
         print("web_search failed", file=sys.stderr)
+        return 1
+
+    news = web_search(
+        "Federal Reserve interest rates",
+        max_results=3,
+        category="news",
+        freshness="week",
+    )
+    _print("web_search_news", news)
+    if news.get("error"):
+        print("web_search news category failed", file=sys.stderr)
+        return 1
+    if news.get("category") != "news":
+        print("expected category=news in response", file=sys.stderr)
+        return 1
+    if not news.get("results"):
+        print("expected at least one news result", file=sys.stderr)
+        return 1
+
+    finance = news_search(
+        "Federal Reserve interest rates",
+        topic="finance",
+        max_results=5,
+        freshness="week",
+    )
+    _print("news_search_finance", finance)
+    if finance.get("error"):
+        print("news_search finance failed", file=sys.stderr)
+        return 1
+    if not finance.get("results"):
+        print("expected finance news results", file=sys.stderr)
+        return 1
+
+    politics = news_search(
+        "US Congress",
+        topic="politics",
+        max_results=5,
+        freshness="week",
+    )
+    _print("news_search_politics", politics)
+    if politics.get("error"):
+        print("news_search politics failed", file=sys.stderr)
+        return 1
+    if not politics.get("results"):
+        print("expected politics news results", file=sys.stderr)
         return 1
 
     weather = get_weather("San Jose, California", forecast_days=3)

@@ -9,6 +9,7 @@ import os
 import socket
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -62,8 +63,9 @@ def _cache_connect() -> sqlite3.Connection:
     return conn
 
 
-def cache_get(namespace: str, key: str) -> Any | None:
-    if CACHE_TTL_SECONDS <= 0:
+def cache_get(namespace: str, key: str, ttl_seconds: int | None = None) -> Any | None:
+    ttl = CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    if ttl <= 0:
         return None
 
     digest = hashlib.sha256(f"{namespace}:{key}".encode()).hexdigest()
@@ -77,14 +79,20 @@ def cache_get(namespace: str, key: str) -> Any | None:
         return None
 
     value, created_at = row
-    if time.time() - created_at > CACHE_TTL_SECONDS:
+    if time.time() - created_at > ttl:
         return None
 
     return json.loads(value)
 
 
-def cache_set(namespace: str, key: str, value: Any) -> None:
-    if CACHE_TTL_SECONDS <= 0:
+def cache_set(
+    namespace: str,
+    key: str,
+    value: Any,
+    ttl_seconds: int | None = None,
+) -> None:
+    ttl = CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    if ttl <= 0:
         return
 
     digest = hashlib.sha256(f"{namespace}:{key}".encode()).hexdigest()
@@ -169,12 +177,14 @@ def _search_searxng(
     query: str,
     max_results: int,
     freshness: str,
+    category: str = "general",
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "q": query,
         "format": "json",
         "language": "en",
         "safesearch": 0,
+        "categories": "news" if category == "news" else "general",
     }
     if freshness in {"day", "week", "month", "year"}:
         params["time_range"] = freshness
@@ -197,11 +207,13 @@ def _search_searxng(
                 "snippet": item.get("content", ""),
                 "published_date": item.get("publishedDate"),
                 "engine": item.get("engine"),
+                "source": item.get("engine"),
             }
         )
 
     return {
         "query": query,
+        "category": category,
         "backend": "searxng",
         "result_count": len(results),
         "results": results,
@@ -212,6 +224,7 @@ def _search_ddgs(
     query: str,
     max_results: int,
     freshness: str,
+    category: str = "general",
 ) -> dict[str, Any]:
     from ddgs import DDGS
 
@@ -221,21 +234,34 @@ def _search_ddgs(
         "month": "m",
         "year": "y",
     }
-    timelimit = timelimit_map.get(freshness)
+    # News endpoints are already recency-biased; default to week when unset.
+    effective_freshness = freshness
+    if category == "news" and not effective_freshness:
+        effective_freshness = "week"
+    timelimit = timelimit_map.get(effective_freshness)
 
     # Prefer stable backends; "auto" can hit flaky engines.
     backend = os.getenv("DDGS_BACKEND", "duckduckgo,bing,brave,yahoo")
 
     with DDGS() as ddgs:
-        raw = list(
-            ddgs.text(
-                query,
-                max_results=max_results,
-                timelimit=timelimit,
-                safesearch="off",
-                backend=backend,
+        if category == "news":
+            raw = list(
+                ddgs.news(
+                    query,
+                    max_results=max_results,
+                    timelimit=timelimit,
+                )
             )
-        )
+        else:
+            raw = list(
+                ddgs.text(
+                    query,
+                    max_results=max_results,
+                    timelimit=timelimit,
+                    safesearch="off",
+                    backend=backend,
+                )
+            )
 
     results = []
     for item in raw[:max_results]:
@@ -246,38 +272,451 @@ def _search_ddgs(
                 "snippet": item.get("body") or item.get("content", ""),
                 "published_date": item.get("date"),
                 "engine": item.get("source") or "ddgs",
+                "source": item.get("source") or item.get("engine") or "ddgs",
             }
         )
 
     return {
         "query": query,
-        "backend": "ddgs",
+        "category": category,
+        "backend": "ddgs_news" if category == "news" else "ddgs",
         "result_count": len(results),
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# News search (finance / politics oriented)
+# ---------------------------------------------------------------------------
+
+_TRUSTED_NEWS_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "bloomberg.com",
+    "ft.com",
+    "wsj.com",
+    "cnbc.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "nytimes.com",
+    "washingtonpost.com",
+    "economist.com",
+    "politico.com",
+    "thehill.com",
+    "axios.com",
+    "marketwatch.com",
+    "barrons.com",
+    "npr.org",
+    "pbs.org",
+    "theguardian.com",
+    "latimes.com",
+    "federalreserve.gov",
+    "sec.gov",
+    "treasury.gov",
+    "whitehouse.gov",
+    "congress.gov",
+    "ecb.europa.eu",
+    "imf.org",
+    "worldbank.org",
+}
+
+_TOPIC_TRUSTED_DOMAINS = {
+    "finance": {
+        "reuters.com",
+        "bloomberg.com",
+        "ft.com",
+        "wsj.com",
+        "cnbc.com",
+        "marketwatch.com",
+        "barrons.com",
+        "economist.com",
+        "federalreserve.gov",
+        "sec.gov",
+        "treasury.gov",
+        "ecb.europa.eu",
+        "imf.org",
+        "yahoo.com",  # Yahoo Finance often appears as source host variants
+        "finance.yahoo.com",
+    },
+    "politics": {
+        "reuters.com",
+        "apnews.com",
+        "politico.com",
+        "thehill.com",
+        "axios.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "nytimes.com",
+        "washingtonpost.com",
+        "npr.org",
+        "pbs.org",
+        "congress.gov",
+        "whitehouse.gov",
+        "theguardian.com",
+    },
+}
+
+_DEMOTED_NEWS_DOMAINS = {
+    "fool.com",
+    "seekingalpha.com",
+    "medium.com",
+    "substack.com",
+    "reddit.com",
+    "youtube.com",
+    "tiktok.com",
+    "facebook.com",
+    "x.com",
+    "twitter.com",
+    "kiplinger.com",
+    "businesstech.co.za",
+}
+
+# Consumer personal-finance clickbait often pollutes "Fed/rates" queries.
+_FINANCE_NOISE_TERMS = {
+    "heloc",
+    "mortgage rates today",
+    "high-yield savings",
+    "credit card",
+    "refinance",
+    "best cd rates",
+    "savings account",
+}
+
+_TOPIC_QUERY_HINTS = {
+    "finance": (
+        "markets OR stocks OR bonds OR Fed OR \"central bank\" OR earnings OR "
+        "inflation OR rates OR economy"
+    ),
+    "politics": (
+        "Congress OR election OR government OR legislation OR \"White House\" OR "
+        "policy OR diplomacy OR geopolitics"
+    ),
+}
+
+
+def _result_domain(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _domain_trust_score(domain: str, topic: str) -> int:
+    if not domain:
+        return 0
+    preferred = _TOPIC_TRUSTED_DOMAINS.get(topic, set()) | _TRUSTED_NEWS_DOMAINS
+    if domain in preferred:
+        return 50
+    if any(domain.endswith("." + d) or domain == d for d in preferred):
+        return 50
+    # Light penalty for common low-signal / opinion-heavy hosts.
+    demoted = {
+        "fool.com",
+        "seekingalpha.com",
+        "medium.com",
+        "substack.com",
+        "reddit.com",
+        "youtube.com",
+        "tiktok.com",
+        "facebook.com",
+        "x.com",
+        "twitter.com",
+    }
+    if domain in demoted or any(domain.endswith("." + d) for d in demoted):
+        return -20
+    return 0
+
+
+def _parse_news_timestamp(value: Any) -> float:
+    if value is None:
+        return 0.0
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    # ISO-ish
+    try:
+        iso = text.replace("Z", "+00:00")
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        pass
+    # RFC 2822 (Google News RSS)
+    try:
+        from email.utils import parsedate_to_datetime
+
+        return parsedate_to_datetime(text).timestamp()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return 0.0
+
+
+def _normalize_news_item(item: dict[str, Any], *, backend: str) -> dict[str, Any] | None:
+    title = (item.get("title") or "").strip()
+    url = (item.get("url") or item.get("href") or "").strip()
+    if not title or not url:
+        return None
+    source = (item.get("source") or item.get("engine") or backend or "").strip()
+    # Google RSS titles often end with " - Source"
+    if " - " in title and source and title.endswith(source):
+        title = title[: -(len(source) + 3)].rstrip()
+    return {
+        "title": title,
+        "url": url,
+        "snippet": (item.get("snippet") or item.get("body") or item.get("content") or "").strip(),
+        "published_date": item.get("published_date") or item.get("date") or item.get("pubDate"),
+        "source": source,
+        "engine": backend,
+    }
+
+
+def _dedupe_news_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        key = (item.get("url") or "").split("?")[0].lower()
+        title_key = " ".join((item.get("title") or "").lower().split())
+        fingerprint = key or title_key
+        if not fingerprint or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(item)
+    return unique
+
+
+def _rank_news_results(
+    items: list[dict[str, Any]],
+    *,
+    topic: str,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    ranked: list[tuple[tuple[int, float], dict[str, Any]]] = []
+    for item in items:
+        domain = _result_domain(item.get("url") or "")
+        trust = _domain_trust_score(domain, topic)
+        ts = _parse_news_timestamp(item.get("published_date"))
+        ranked.append(((trust, ts), item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in ranked[:max_results]]
+
+
+def _search_google_news_rss(
+    query: str,
+    max_results: int,
+    freshness: str,
+) -> list[dict[str, Any]]:
+    """Fetch recent headlines from Google News RSS (no API key)."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote_plus
+
+    when_map = {
+        "day": "when:1d",
+        "week": "when:7d",
+        "month": "when:1m",
+        "year": "when:1y",
+    }
+    q = query.strip()
+    if freshness in when_map:
+        q = f"{q} {when_map[freshness]}"
+
+    url = (
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    response = requests.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml"},
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+
+    results: list[dict[str, Any]] = []
+    for item in root.findall("./channel/item")[: max_results * 2]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        source_el = item.find("source")
+        source = (source_el.text or "").strip() if source_el is not None else ""
+        pub = (item.findtext("pubDate") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        normalized = _normalize_news_item(
+            {
+                "title": title,
+                "url": link,
+                "snippet": desc,
+                "published_date": pub,
+                "source": source,
+            },
+            backend="google_news_rss",
+        )
+        if normalized:
+            results.append(normalized)
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def news_search(
+    query: str,
+    topic: str = "",
+    max_results: int = 8,
+    freshness: str = "day",
+) -> dict[str, Any]:
+    """
+    Search recent news headlines for professional briefings.
+
+    Prefer this tool for finance, markets, politics, geopolitics, elections,
+    central banks, regulation, earnings, and any "latest/breaking" news.
+
+    topic may be:
+    - "" (general news)
+    - "finance" — markets, Fed/ECB, earnings, inflation, regulation
+    - "politics" — elections, legislation, government, geopolitics
+
+    freshness defaults to "day" (also accepts week/month/year).
+    Results are merged from Google News RSS and web news backends, then ranked
+    toward reputable outlets. Always confirm material claims with read_webpage.
+    """
+    query = (query or "").strip()
+    if not query:
+        return {"error": "query must be a non-empty string."}
+
+    topic = (topic or "").strip().lower()
+    if topic not in {"", "finance", "politics"}:
+        return {"error": 'topic must be "", "finance", or "politics".'}
+
+    freshness = (freshness or "day").strip().lower()
+    if freshness not in {"day", "week", "month", "year"}:
+        return {
+            "error": 'freshness must be "day", "week", "month", or "year".'
+        }
+
+    max_results = max(3, min(int(max_results), 12))
+
+    search_query = query
+    if topic and topic in _TOPIC_QUERY_HINTS and _TOPIC_QUERY_HINTS[topic] not in query:
+        # Soft topical bias without replacing the user's wording.
+        search_query = f"{query} ({_TOPIC_QUERY_HINTS[topic]})"
+
+    cache_key = json.dumps(
+        {
+            "query": query,
+            "search_query": search_query,
+            "topic": topic,
+            "max_results": max_results,
+            "freshness": freshness,
+        },
+        sort_keys=True,
+    )
+    news_ttl = min(CACHE_TTL_SECONDS, 180)
+    cached = cache_get("news_search", cache_key, ttl_seconds=news_ttl)
+    if cached is not None:
+        return {**cached, "cached": True}
+
+    collected: list[dict[str, Any]] = []
+    backends_used: list[str] = []
+    errors: list[str] = []
+
+    try:
+        rss_items = _search_google_news_rss(
+            search_query,
+            max_results=max_results,
+            freshness=freshness,
+        )
+        if rss_items:
+            collected.extend(rss_items)
+            backends_used.append("google_news_rss")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"google_news_rss: {exc}")
+
+    try:
+        ddgs_payload = _search_ddgs(
+            query,
+            max_results=max_results,
+            freshness=freshness,
+            category="news",
+        )
+        for raw in ddgs_payload.get("results") or []:
+            normalized = _normalize_news_item(raw, backend="ddgs_news")
+            if normalized:
+                collected.append(normalized)
+        backends_used.append("ddgs_news")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"ddgs_news: {exc}")
+
+    # Optional SearXNG news category when available.
+    if _searxng_available():
+        try:
+            searx = _search_searxng(
+                query,
+                max_results=max_results,
+                freshness=freshness,
+                category="news",
+            )
+            for raw in searx.get("results") or []:
+                normalized = _normalize_news_item(raw, backend="searxng_news")
+                if normalized:
+                    collected.append(normalized)
+            backends_used.append("searxng_news")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"searxng_news: {exc}")
+
+    unique = _dedupe_news_results(collected)
+    ranked = _rank_news_results(unique, topic=topic, max_results=max_results)
+
+    if not ranked:
+        return {
+            "error": "News search returned no results.",
+            "query": query,
+            "topic": topic or None,
+            "freshness": freshness,
+            "backends": backends_used,
+            "backend_errors": errors or None,
+        }
+
+    result = {
+        "query": query,
+        "topic": topic or None,
+        "freshness": freshness,
+        "backends": backends_used,
+        "result_count": len(ranked),
+        "results": ranked,
+        "note": (
+            "Headlines only. Open 1-3 high-quality URLs with read_webpage "
+            "before stating market-moving or political facts."
+        ),
+    }
+    if errors:
+        result["backend_errors"] = errors
+
+    cache_set("news_search", cache_key, result, ttl_seconds=news_ttl)
+    return {**result, "cached": False}
 
 
 def web_search(
     query: str,
     max_results: int = 5,
     freshness: str = "",
+    category: str = "general",
 ) -> dict[str, Any]:
     """
     Search the public web for current information.
 
-    Prefer this for news, sports results, documentation, schedules, and any
-    fact that may have changed recently.
+    Prefer this for news, markets, politics, sports, documentation, schedules,
+    and any fact that may have changed recently.
 
-    Use the current year from the system prompt when a year is needed in the
-    query. Do not invent a year from training data. For recent results, prefer
-    the freshness parameter over stuffing an outdated year into the query.
+    category:
+    - "general" — broad web search (default)
+    - "news" — news/wire headlines; use for finance, politics, geopolitics,
+      elections, central banks, regulation, earnings, and breaking news
 
     freshness may be:
-    - "" (any time)
-    - "day"
+    - "" (any time; for category="news", backends may still bias recent)
+    - "day" — preferred for breaking / same-day finance & politics
     - "week"
     - "month"
     - "year"
+
+    Use the current year from the system prompt when a year is needed in the
+    query. Do not invent a year from training data. For recent results, prefer
+    freshness + category="news" over stuffing an outdated year into the query.
     """
     query = (query or "").strip()
     if not query:
@@ -290,30 +729,42 @@ def web_search(
             "error": 'freshness must be "", "day", "week", "month", or "year".'
         }
 
+    category = (category or "general").strip().lower()
+    if category not in {"general", "news"}:
+        return {"error": 'category must be "general" or "news".'}
+
     cache_key = json.dumps(
-        {"query": query, "max_results": max_results, "freshness": freshness},
+        {
+            "query": query,
+            "max_results": max_results,
+            "freshness": freshness,
+            "category": category,
+        },
         sort_keys=True,
     )
-    cached = cache_get("web_search", cache_key)
+    # Keep news results fresher than general web search.
+    cache_namespace = "web_search_news" if category == "news" else "web_search"
+    news_ttl = min(CACHE_TTL_SECONDS, 300) if category == "news" else None
+    cached = cache_get(cache_namespace, cache_key, ttl_seconds=news_ttl)
     if cached is not None:
         return {**cached, "cached": True}
 
     backend = SEARCH_BACKEND.lower()
     try:
         if backend == "searxng":
-            result = _search_searxng(query, max_results, freshness)
+            result = _search_searxng(query, max_results, freshness, category)
         elif backend == "ddgs":
-            result = _search_ddgs(query, max_results, freshness)
+            result = _search_ddgs(query, max_results, freshness, category)
         else:
             # auto: prefer local SearXNG when available
             if _searxng_available():
-                result = _search_searxng(query, max_results, freshness)
+                result = _search_searxng(query, max_results, freshness, category)
             else:
-                result = _search_ddgs(query, max_results, freshness)
+                result = _search_ddgs(query, max_results, freshness, category)
     except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
         if backend == "auto":
             try:
-                result = _search_ddgs(query, max_results, freshness)
+                result = _search_ddgs(query, max_results, freshness, category)
             except Exception as fallback_exc:  # noqa: BLE001
                 return {
                     "error": (
@@ -324,7 +775,7 @@ def web_search(
         else:
             return {"error": f"Search failed ({backend}): {exc}"}
 
-    cache_set("web_search", cache_key, result)
+    cache_set(cache_namespace, cache_key, result, ttl_seconds=news_ttl)
     return {**result, "cached": False}
 
 
@@ -653,9 +1104,10 @@ def get_weather(
 
 
 AVAILABLE_FUNCTIONS = {
+    "news_search": news_search,
     "web_search": web_search,
     "read_webpage": read_webpage,
     "get_weather": get_weather,
 }
 
-TOOL_FUNCTIONS = [web_search, read_webpage, get_weather]
+TOOL_FUNCTIONS = [news_search, web_search, read_webpage, get_weather]

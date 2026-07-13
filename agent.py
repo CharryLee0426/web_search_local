@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive Ollama agent with local web_search / read_webpage / get_weather tools."""
+"""Interactive Ollama agent with local news_search / web_search / read_webpage / get_weather tools."""
 
 from __future__ import annotations
 

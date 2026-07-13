@@ -137,7 +137,7 @@ def root() -> dict[str, Any]:
         "ollama_host": OLLAMA_HOST,
         "default_model": OLLAMA_MODEL,
         "openai_base_url": f"http://127.0.0.1:{PORT}/v1",
-        "tools": ["web_search", "read_webpage", "get_weather"],
+        "tools": ["news_search", "web_search", "read_webpage", "get_weather"],
         "hint": "POST /v1/chat/completions with OpenAI-compatible payloads.",
     }
 
@@ -303,7 +303,7 @@ def main() -> None:
     print(f"  OpenAI base URL : http://127.0.0.1:{PORT}/v1")
     print(f"  Ollama host     : {OLLAMA_HOST}")
     print(f"  Default model   : {OLLAMA_MODEL}")
-    print(f"  Tools           : web_search, read_webpage, get_weather")
+    print(f"  Tools           : news_search, web_search, read_webpage, get_weather")
     uvicorn.run(
         "server:app",
         host=HOST,
