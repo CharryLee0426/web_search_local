@@ -40,6 +40,7 @@ Client (curl / Open WebUI / OpenAI SDK / CLI)
 Also included:
 
 - **OpenAI-compatible gateway** — plug into any client that speaks `/v1/chat/completions`
+- **TypeScript playground** — ChatGPT-style web UI under `playground/` (Vercel-ready)
 - **CLI research agent** — interactive or one-shot prompts
 - **MCP server** — reuse the same tools from MCP-capable apps
 - **SQLite result cache** — fewer duplicate network calls
@@ -143,7 +144,28 @@ print(response.choices[0].message.content)
    (from Docker: `http://host.docker.internal:8000/v1`)  
 3. API Key: `ollama`
 
-### Option B — CLI agent
+### Option B — TypeScript playground (ChatGPT-style UI)
+
+A Next.js app under `playground/` that talks to the same gateway. Start the gateway first, then:
+
+```bash
+cd playground
+cp .env.example .env.local
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+| Setting | Value |
+|---------|--------|
+| Gateway | `GATEWAY_BASE_URL` (default `http://127.0.0.1:8000`) |
+| API key | `GATEWAY_API_KEY` (default `ollama`) |
+| Model | Picked in the sidebar; default `qwen3.6:latest` |
+
+**Deploy on Vercel:** set the project Root Directory to `playground`, then configure `GATEWAY_BASE_URL` to a publicly reachable gateway URL (Vercel cannot call your laptop’s `localhost` — use a tunnel such as ngrok). See [`playground/README.md`](playground/README.md) for details.
+
+### Option C — CLI agent
 
 ```bash
 source .venv/bin/activate
@@ -157,7 +179,7 @@ python agent.py -v "What will the weather be next week in San Jose, California?"
 
 `-v` prints tool calls and truncated results to stderr.
 
-### Option C — MCP server
+### Option D — MCP server
 
 ```bash
 source .venv/bin/activate
@@ -193,6 +215,7 @@ web_search/
 ├── compose.yaml        # SearXNG + Valkey
 ├── searxng/settings.yml
 ├── requirements.txt
+├── playground/         # ChatGPT-style Next.js UI (TypeScript, Vercel)
 └── README.md
 ```
 

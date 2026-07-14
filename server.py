@@ -11,10 +11,13 @@ Examples: curl, Open WebUI, Continue, Cursor, openai Python SDK.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 import uuid
+from queue import Empty, Queue
+from threading import Thread
 from typing import Any
 
 import ollama
@@ -130,6 +133,34 @@ def _sse(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _run_tool_loop_with_live_events(
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    temperature: float,
+    enable_tools: bool,
+    verbose: bool,
+    event_queue: Queue,
+) -> None:
+    """Blocking worker that pushes live tool events, then the final result."""
+
+    def on_event(event: dict[str, Any]) -> None:
+        event_queue.put(("tool_event", event))
+
+    try:
+        result = run_tool_loop(
+            messages,
+            model=model,
+            temperature=temperature,
+            enable_tools=enable_tools,
+            verbose=verbose,
+            on_event=on_event,
+        )
+        event_queue.put(("result", result))
+    except Exception as exc:  # noqa: BLE001
+        event_queue.put(("error", exc))
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -190,48 +221,128 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     model = body.model or OLLAMA_MODEL
     temperature = 0.1 if body.temperature is None else float(body.temperature)
     runtime_messages = _to_runtime_messages(body.messages)
-
-    # If the client already provided tools, we still inject ours unless disabled.
     enable_tools = body.enable_web_tools
-
-    try:
-        result = run_tool_loop(
-            runtime_messages,
-            model=model,
-            temperature=temperature,
-            enable_tools=enable_tools,
-            verbose=os.getenv("GATEWAY_VERBOSE", "0") == "1",
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Ollama/tool loop failed: {exc}") from exc
-
-    content = result["content"]
-    payload = _completion_payload(model, content, result["tool_events"])
+    verbose = os.getenv("GATEWAY_VERBOSE", "0") == "1"
 
     if not body.stream:
+        try:
+            result = await asyncio.to_thread(
+                run_tool_loop,
+                runtime_messages,
+                model=model,
+                temperature=temperature,
+                enable_tools=enable_tools,
+                verbose=verbose,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Ollama/tool loop failed: {exc}") from exc
+
+        payload = _completion_payload(model, result["content"], result["tool_events"])
         return JSONResponse(payload)
 
-    async def event_stream():
-        created = payload["created"]
-        chunk_id = payload["id"]
+    created = int(time.time())
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    event_queue: Queue = Queue()
 
-        # Announce that tools may have been used, then stream the final answer.
-        header = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": created,
+    worker = Thread(
+        target=_run_tool_loop_with_live_events,
+        kwargs={
+            "messages": runtime_messages,
             "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": ""},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield _sse(header)
+            "temperature": temperature,
+            "enable_tools": enable_tools,
+            "verbose": verbose,
+            "event_queue": event_queue,
+        },
+        daemon=True,
+    )
+    worker.start()
 
-        # Stream in small chunks for UI responsiveness.
+    async def event_stream():
+        yield _sse(
+            {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        yield _sse(
+            {
+                "id": chunk_id,
+                "object": "local_web_tools.status",
+                "created": created,
+                "model": model,
+                "phase": "thinking",
+                "label": (
+                    "Thinking and researching with local web tools…"
+                    if enable_tools
+                    else "Thinking with the local model…"
+                ),
+            }
+        )
+        # Force the ASGI server to flush the thinking status immediately.
+        await asyncio.sleep(0)
+
+        result: dict[str, Any] | None = None
+
+        while True:
+            if await request.is_disconnected():
+                return
+
+            try:
+                kind, payload = await asyncio.to_thread(event_queue.get, True, 0.25)
+            except Empty:
+                if not worker.is_alive() and event_queue.empty():
+                    yield _sse(
+                        {
+                            "id": chunk_id,
+                            "object": "error",
+                            "error": {"message": "Tool loop ended without a result"},
+                        }
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                continue
+
+            if kind == "tool_event":
+                yield _sse(
+                    {
+                        "id": chunk_id,
+                        "object": "local_web_tools.event",
+                        "created": created,
+                        "model": model,
+                        "event": payload,
+                    }
+                )
+                continue
+
+            if kind == "error":
+                message = str(payload)
+                yield _sse(
+                    {
+                        "id": chunk_id,
+                        "object": "error",
+                        "error": {"message": f"Ollama/tool loop failed: {message}"},
+                    }
+                )
+                yield "data: [DONE]\n\n"
+                return
+
+            if kind == "result":
+                result = payload
+                break
+
+        assert result is not None
+        content = result["content"]
+
         step = 48
         for index in range(0, len(content), step):
             if await request.is_disconnected():
@@ -252,6 +363,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
                     ],
                 }
             )
+            await asyncio.sleep(0)
 
         yield _sse(
             {
@@ -282,7 +394,8 @@ async def simple_chat(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="message is required")
 
     model = data.get("model") or OLLAMA_MODEL
-    result = run_tool_loop(
+    result = await asyncio.to_thread(
+        run_tool_loop,
         [
             {"role": "system", "content": build_system_prompt()},
             {"role": "user", "content": message},
